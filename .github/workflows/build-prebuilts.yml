@@ -1,0 +1,213 @@
+# Build + publish ffmpeg static-lib tarballs for Acrux.
+#
+# Triggered manually via `gh workflow run build-prebuilts.yml` (or
+# the "Run workflow" button in the GitHub UI). All three platforms
+# run in parallel, each producing one tarball uploaded as a release
+# asset under the `ffmpeg-prebuilt-vX.Y.Z` tag (see the `version`
+# input below).
+#
+# What each job does:
+#   1. Compile ffmpeg-sys-next's `build` feature in a scratch crate
+#      — that does the heavy lifting of cloning ffmpeg source and
+#      ./configure + make with the right flags (LGPLv3, OpenSSL for
+#      RTMPS, no encoders we don't use).
+#   2. Pluck the resulting libavformat/libavcodec/libavutil out of
+#      the build output.
+#   3. Strip debug symbols.
+#   4. Tar + upload as `ffmpeg-prebuilt-{os}-{arch}.tar.gz` to the
+#      release.
+#
+# Windows-specific footgun: ffmpeg's configure script needs a POSIX
+# shell, but Git Bash's sh.exe pulls in Git's `usr/bin` directory
+# which contains a GNU coreutils `link.exe` that shadows MSVC's
+# link.exe inside the sh.exe child process. We work around this by
+# carving Git out of PATH right before the cargo build kicks off —
+# leaving just the MSVC toolchain + the bare sh.exe path we need.
+
+name: Build ffmpeg prebuilts
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'ffmpeg version tag (e.g. v8.1.0). Will be released as ffmpeg-prebuilt-{version}.'
+        required: true
+        default: 'v8.1.0'
+
+jobs:
+  build:
+    name: ${{ matrix.tarball }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            tarball: ffmpeg-prebuilt-darwin-arm64
+            strip: strip -S
+            lib_ext: .a
+            lib_prefix: lib
+          - runner: macos-13
+            tarball: ffmpeg-prebuilt-darwin-x86_64
+            strip: strip -S
+            lib_ext: .a
+            lib_prefix: lib
+          - runner: ubuntu-22.04
+            tarball: ffmpeg-prebuilt-linux-x86_64
+            strip: strip -g
+            lib_ext: .a
+            lib_prefix: lib
+          - runner: windows-2022
+            tarball: ffmpeg-prebuilt-windows-x86_64
+            strip: ''  # MSVC archives stripped by linker on consume side
+            lib_ext: .a  # ffmpeg-sys-next produces .a even on Windows because it builds via mingw-make + gcc when using the build feature
+            lib_prefix: lib
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # Mac / Linux build-time deps. Mac already has clang + git via
+      # Xcode CLT pre-installed on GHA runners; Linux needs nasm +
+      # build-essential.
+      - name: Install Linux deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nasm yasm pkg-config libssl-dev
+
+      - name: Install Mac deps
+        if: runner.os == 'macOS'
+        run: |
+          brew install nasm yasm pkg-config openssl@3
+
+      # Windows: install nasm + yasm via choco. Carve Git out of
+      # PATH so MSVC's link.exe wins over Git's coreutils one (the
+      # core ffmpeg-on-Windows-from-source footgun).
+      - name: Install Windows deps
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install -y nasm yasm
+          # Refresh env so nasm/yasm are findable in subsequent steps
+          $nasmPath = (Get-Command nasm).Source | Split-Path
+          echo "$nasmPath" | Out-File -FilePath $env:GITHUB_PATH -Append
+
+      # Build ffmpeg via ffmpeg-sys-next's `build` feature in a
+      # throwaway crate. Same code path Acrux's `build.rs` used to
+      # invoke, just isolated here so the artifact is reproducible.
+      - name: Create scratch crate
+        shell: bash
+        run: |
+          mkdir -p /tmp/scratch
+          cat > /tmp/scratch/Cargo.toml <<'EOF'
+          [package]
+          name = "ffmpeg-scratch"
+          version = "0.1.0"
+          edition = "2021"
+
+          [dependencies]
+          ffmpeg-next = { version = "8.1", default-features = false, features = [
+            "codec", "format", "build", "build-license-version3", "build-lib-openssl",
+          ] }
+          EOF
+          mkdir -p /tmp/scratch/src
+          echo "fn main() {}" > /tmp/scratch/src/main.rs
+
+      # The actual compile. On Windows we run this from a developer
+      # PowerShell with vcvars64 applied via ilammy/msvc-dev-cmd, and
+      # we manually scrub Git from PATH before launching cargo so
+      # ffmpeg's configure can't pick up the wrong link.exe.
+      - name: Set up MSVC (Windows only)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Build ffmpeg (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        working-directory: /tmp/scratch
+        run: |
+          # Strip Git's bin + usr/bin out of PATH so MSVC's link.exe
+          # isn't shadowed by Git's coreutils link.exe inside sh.exe.
+          $clean = ($env:PATH -split ';') | Where-Object {
+            $_ -notmatch '\\Git\\(usr\\)?bin\b' -and $_ -ne ''
+          }
+          $env:PATH = ($clean -join ';')
+          # ffmpeg's configure still needs sh.exe. Git's sh.exe lives
+          # at C:\Program Files\Git\bin\sh.exe even after we stripped
+          # the bin dir; we add it back surgically (only sh.exe's dir,
+          # not coreutils).
+          $env:PATH = "C:\Program Files\Git\bin;$env:PATH"
+          cargo build --release
+
+      - name: Build ffmpeg (Mac / Linux)
+        if: runner.os != 'Windows'
+        shell: bash
+        working-directory: /tmp/scratch
+        run: cargo build --release
+
+      # Find and stage the libs. ffmpeg-sys-next dumps headers + libs
+      # at `target/release/build/ffmpeg-sys-next-*/out/dist/`.
+      - name: Stage libs (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          DIST=$(ls -d /tmp/scratch/target/release/build/ffmpeg-sys-next-*/out/dist | head -1)
+          STAGE=/tmp/stage
+          mkdir -p "$STAGE/include" "$STAGE/lib"
+          cp -R "$DIST/include/"* "$STAGE/include/"
+          cp "$DIST/lib/"*.a "$STAGE/lib/"
+          # Strip debug symbols — cuts the tarball ~10x.
+          ${{ matrix.strip }} "$STAGE/lib/"*.a || true
+          ls -lh "$STAGE/lib/"
+
+      - name: Stage libs (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $dist = (Get-ChildItem 'C:\Users\runneradmin\AppData\Local\Temp\scratch\target\release\build\ffmpeg-sys-next-*\out\dist' -Directory | Select-Object -First 1).FullName
+          if (-not $dist) {
+            # GHA Windows runner uses different tmp location
+            $dist = (Get-ChildItem '/tmp/scratch/target/release/build/ffmpeg-sys-next-*/out/dist' -Directory | Select-Object -First 1).FullName
+          }
+          $stage = "$env:TEMP\stage"
+          New-Item -ItemType Directory -Force -Path "$stage\include","$stage\lib" | Out-Null
+          Copy-Item "$dist\include\*" "$stage\include\" -Recurse
+          Get-ChildItem "$dist\lib\*.a" | Copy-Item -Destination "$stage\lib\"
+          Get-ChildItem "$stage\lib\"
+
+      - name: Package tarball
+        shell: bash
+        run: |
+          STAGE=${{ runner.os == 'Windows' && '/tmp/stage' || '/tmp/stage' }}
+          # Windows GHA: $env:TEMP is something like D:\a\_temp; bash translates that.
+          if [ ! -d "$STAGE" ]; then
+            STAGE="${TEMP:-/tmp}/stage"
+          fi
+          cd "$STAGE"
+          tar -czf /tmp/${{ matrix.tarball }}.tar.gz include lib
+          ls -lh /tmp/${{ matrix.tarball }}.tar.gz
+          # Print SHA256 to the workflow log so we can copy it into
+          # Acrux's build.rs constants.
+          if command -v shasum >/dev/null 2>&1; then
+            shasum -a 256 /tmp/${{ matrix.tarball }}.tar.gz
+          else
+            sha256sum /tmp/${{ matrix.tarball }}.tar.gz
+          fi
+
+      - name: Upload tarball as release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ffmpeg-prebuilt-${{ inputs.version }}
+          name: ffmpeg prebuilt ${{ inputs.version }}
+          body: |
+            Static ffmpeg libs (LGPLv3, mux + RTMP + OpenSSL, no
+            encoders) consumed by Acrux's `build.rs`. Built
+            reproducibly from this workflow — see workflow log for
+            SHA256s to paste into Acrux's `build.rs`.
+          files: /tmp/${{ matrix.tarball }}.tar.gz
+          fail_on_unmatched_files: true
