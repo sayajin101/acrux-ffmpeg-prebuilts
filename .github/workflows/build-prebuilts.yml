@@ -111,8 +111,8 @@ jobs:
       - name: Create scratch crate
         shell: bash
         run: |
-          mkdir -p /tmp/scratch
-          cat > /tmp/scratch/Cargo.toml <<'EOF'
+          mkdir -p ${{ runner.temp }}/scratch
+          cat > ${{ runner.temp }}/scratch/Cargo.toml <<'EOF'
           [package]
           name = "ffmpeg-scratch"
           version = "0.1.0"
@@ -123,8 +123,8 @@ jobs:
             "codec", "format", "build", "build-license-version3", "build-lib-openssl",
           ] }
           EOF
-          mkdir -p /tmp/scratch/src
-          echo "fn main() {}" > /tmp/scratch/src/main.rs
+          mkdir -p ${{ runner.temp }}/scratch/src
+          echo "fn main() {}" > ${{ runner.temp }}/scratch/src/main.rs
 
       # The actual compile. On Windows we run this from a developer
       # PowerShell with vcvars64 applied via ilammy/msvc-dev-cmd, and
@@ -139,7 +139,7 @@ jobs:
       - name: Build ffmpeg (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
-        working-directory: /tmp/scratch
+        working-directory: ${{ runner.temp }}/scratch
         run: |
           # Strip Git's bin + usr/bin out of PATH so MSVC's link.exe
           # isn't shadowed by Git's coreutils link.exe inside sh.exe.
@@ -157,56 +157,47 @@ jobs:
       - name: Build ffmpeg (Mac / Linux)
         if: runner.os != 'Windows'
         shell: bash
-        working-directory: /tmp/scratch
+        working-directory: ${{ runner.temp }}/scratch
         run: cargo build --release
 
       # Find and stage the libs. ffmpeg-sys-next dumps headers + libs
-      # at `target/release/build/ffmpeg-sys-next-*/out/dist/`.
-      - name: Stage libs (Unix)
-        if: runner.os != 'Windows'
+      # at `target/release/build/ffmpeg-sys-next-*/out/dist/`. We use
+      # bash everywhere (Windows runners have Git Bash) so path
+      # handling is uniform — `runner.temp` expands to a path that
+      # bash understands on every OS.
+      - name: Stage libs
         shell: bash
         run: |
-          DIST=$(ls -d /tmp/scratch/target/release/build/ffmpeg-sys-next-*/out/dist | head -1)
-          STAGE=/tmp/stage
+          set -euo pipefail
+          DIST=$(ls -d "${{ runner.temp }}"/scratch/target/release/build/ffmpeg-sys-next-*/out/dist | head -1)
+          STAGE="${{ runner.temp }}/stage"
+          rm -rf "$STAGE"
           mkdir -p "$STAGE/include" "$STAGE/lib"
           cp -R "$DIST/include/"* "$STAGE/include/"
           cp "$DIST/lib/"*.a "$STAGE/lib/"
-          # Strip debug symbols — cuts the tarball ~10x.
-          ${{ matrix.strip }} "$STAGE/lib/"*.a || true
+          # Strip debug symbols — cuts the tarball ~10x. Windows
+          # static libs come out of ffmpeg-sys-next's MinGW-shim
+          # toolchain as ELF/COFF .a archives, which `strip -S`
+          # doesn't always recognise; tolerate failure there.
+          if [ -n "${{ matrix.strip }}" ]; then
+            ${{ matrix.strip }} "$STAGE/lib/"*.a 2>/dev/null || true
+          fi
           ls -lh "$STAGE/lib/"
-
-      - name: Stage libs (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $dist = (Get-ChildItem 'C:\Users\runneradmin\AppData\Local\Temp\scratch\target\release\build\ffmpeg-sys-next-*\out\dist' -Directory | Select-Object -First 1).FullName
-          if (-not $dist) {
-            # GHA Windows runner uses different tmp location
-            $dist = (Get-ChildItem '/tmp/scratch/target/release/build/ffmpeg-sys-next-*/out/dist' -Directory | Select-Object -First 1).FullName
-          }
-          $stage = "$env:TEMP\stage"
-          New-Item -ItemType Directory -Force -Path "$stage\include","$stage\lib" | Out-Null
-          Copy-Item "$dist\include\*" "$stage\include\" -Recurse
-          Get-ChildItem "$dist\lib\*.a" | Copy-Item -Destination "$stage\lib\"
-          Get-ChildItem "$stage\lib\"
 
       - name: Package tarball
         shell: bash
         run: |
-          STAGE=${{ runner.os == 'Windows' && '/tmp/stage' || '/tmp/stage' }}
-          # Windows GHA: $env:TEMP is something like D:\a\_temp; bash translates that.
-          if [ ! -d "$STAGE" ]; then
-            STAGE="${TEMP:-/tmp}/stage"
-          fi
-          cd "$STAGE"
-          tar -czf /tmp/${{ matrix.tarball }}.tar.gz include lib
-          ls -lh /tmp/${{ matrix.tarball }}.tar.gz
+          set -euo pipefail
+          cd "${{ runner.temp }}/stage"
+          TARBALL="${{ runner.temp }}/${{ matrix.tarball }}.tar.gz"
+          tar -czf "$TARBALL" include lib
+          ls -lh "$TARBALL"
           # Print SHA256 to the workflow log so we can copy it into
           # Acrux's build.rs constants.
           if command -v shasum >/dev/null 2>&1; then
-            shasum -a 256 /tmp/${{ matrix.tarball }}.tar.gz
+            shasum -a 256 "$TARBALL"
           else
-            sha256sum /tmp/${{ matrix.tarball }}.tar.gz
+            sha256sum "$TARBALL"
           fi
 
       - name: Upload tarball as release asset
@@ -219,5 +210,5 @@ jobs:
             encoders) consumed by Acrux's `build.rs`. Built
             reproducibly from this workflow — see workflow log for
             SHA256s to paste into Acrux's `build.rs`.
-          files: /tmp/${{ matrix.tarball }}.tar.gz
+          files: ${{ runner.temp }}/${{ matrix.tarball }}.tar.gz
           fail_on_unmatched_files: true
