@@ -108,11 +108,18 @@ jobs:
       # Build ffmpeg via ffmpeg-sys-next's `build` feature in a
       # throwaway crate. Same code path Acrux's `build.rs` used to
       # invoke, just isolated here so the artifact is reproducible.
+      #
+      # On Windows: `${{ runner.temp }}` expands to `D:\a\_temp` —
+      # the backslashes get eaten by bash escape processing (the
+      # `\a` is treated as escape and silently dropped). So we use
+      # the `$RUNNER_TEMP` env var inside the bash script with
+      # quotes — value's resolved at run time, no escape pass.
       - name: Create scratch crate
         shell: bash
         run: |
-          mkdir -p ${{ runner.temp }}/scratch
-          cat > ${{ runner.temp }}/scratch/Cargo.toml <<'EOF'
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/scratch/src"
+          cat > "$RUNNER_TEMP/scratch/Cargo.toml" <<'EOF'
           [package]
           name = "ffmpeg-scratch"
           version = "0.1.0"
@@ -123,8 +130,8 @@ jobs:
             "codec", "format", "build", "build-license-version3", "build-lib-openssl",
           ] }
           EOF
-          mkdir -p ${{ runner.temp }}/scratch/src
-          echo "fn main() {}" > ${{ runner.temp }}/scratch/src/main.rs
+          echo "fn main() {}" > "$RUNNER_TEMP/scratch/src/main.rs"
+          ls -la "$RUNNER_TEMP/scratch"
 
       # The actual compile. On Windows we run this from a developer
       # PowerShell with vcvars64 applied via ilammy/msvc-dev-cmd, and
@@ -169,8 +176,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          DIST=$(ls -d "${{ runner.temp }}"/scratch/target/release/build/ffmpeg-sys-next-*/out/dist | head -1)
-          STAGE="${{ runner.temp }}/stage"
+          DIST=$(ls -d "$RUNNER_TEMP"/scratch/target/release/build/ffmpeg-sys-next-*/out/dist | head -1)
+          STAGE="$RUNNER_TEMP/stage"
           rm -rf "$STAGE"
           mkdir -p "$STAGE/include" "$STAGE/lib"
           cp -R "$DIST/include/"* "$STAGE/include/"
@@ -188,8 +195,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cd "${{ runner.temp }}/stage"
-          TARBALL="${{ runner.temp }}/${{ matrix.tarball }}.tar.gz"
+          cd "$RUNNER_TEMP/stage"
+          TARBALL="$RUNNER_TEMP/${{ matrix.tarball }}.tar.gz"
           tar -czf "$TARBALL" include lib
           ls -lh "$TARBALL"
           # Print SHA256 to the workflow log so we can copy it into
