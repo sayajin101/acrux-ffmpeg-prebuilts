@@ -224,18 +224,22 @@ jobs:
           cd "$RUNNER_TEMP/stage"
           TARBALL="$RUNNER_TEMP/${{ matrix.tarball }}.tar.gz"
           # Windows tarball includes a bin/ dir for the .dlls; Unix
-          # tarballs only have include/ + lib/. Tar both if bin/
-          # exists, otherwise just the two.
+          # tarballs only have include/ + lib/.
           #
-          # `--force-local` tells tar to treat the destination as a
-          # local path even if it contains a colon. Without it,
-          # `D:\a\_temp\...tar.gz` on Windows Git-Bash makes tar
-          # parse `D:` as a remote host ("Cannot connect to D:
-          # resolve failed"). Harmless on Mac/Linux.
+          # `--force-local` is only needed on Windows: GNU tar there
+          # otherwise parses `D:\a\_temp\...tar.gz` as a `host:path`
+          # remote archive (legacy rsh-style) and fails with "Cannot
+          # connect to D: resolve failed". macOS ships BSD tar which
+          # doesn't have --force-local AND doesn't do the host:path
+          # parsing in the first place, so we leave it off there.
+          TAR_FORCE_LOCAL=""
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            TAR_FORCE_LOCAL="--force-local"
+          fi
           if [ -d bin ]; then
-            tar --force-local -czf "$TARBALL" include lib bin
+            tar $TAR_FORCE_LOCAL -czf "$TARBALL" include lib bin
           else
-            tar --force-local -czf "$TARBALL" include lib
+            tar $TAR_FORCE_LOCAL -czf "$TARBALL" include lib
           fi
           ls -lh "$TARBALL"
           # Print SHA256 to the workflow log so we can copy it into
