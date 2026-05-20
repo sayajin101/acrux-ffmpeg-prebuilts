@@ -34,6 +34,13 @@ on:
         required: true
         default: 'v8.1.0'
 
+# `softprops/action-gh-release` updates an existing release — that's
+# a write to the repo's releases, which the default workflow token
+# doesn't have. Without this the upload step fails with "Resource
+# not accessible by integration".
+permissions:
+  contents: write
+
 jobs:
   build:
     name: ${{ matrix.tarball }}
@@ -83,17 +90,20 @@ jobs:
         run: |
           brew install nasm yasm pkg-config openssl@3
 
-      # Windows: install nasm + yasm via choco. Carve Git out of
-      # PATH so MSVC's link.exe wins over Git's coreutils one (the
-      # core ffmpeg-on-Windows-from-source footgun).
+      # Windows: install nasm + yasm via choco. choco doesn't refresh
+      # the current shell's PATH after install — Get-Command nasm
+      # would fail because nasm was just installed but PATH is the
+      # one cached at shell start. We hardcode chocolatey's standard
+      # install locations into GITHUB_PATH instead (which propagates
+      # to subsequent steps cleanly). Choco installs both tools under
+      # C:\Program Files\NASM and C:\ProgramData\chocolatey\bin.
       - name: Install Windows deps
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           choco install -y nasm yasm
-          # Refresh env so nasm/yasm are findable in subsequent steps
-          $nasmPath = (Get-Command nasm).Source | Split-Path
-          echo "$nasmPath" | Out-File -FilePath $env:GITHUB_PATH -Append
+          "C:\Program Files\NASM" | Out-File -FilePath $env:GITHUB_PATH -Append
+          "C:\ProgramData\chocolatey\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
 
       # Build ffmpeg via ffmpeg-sys-next's `build` feature in a
       # throwaway crate. Same code path Acrux's `build.rs` used to
