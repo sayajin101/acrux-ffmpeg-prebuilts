@@ -148,18 +148,43 @@ jobs:
         shell: pwsh
         working-directory: ${{ runner.temp }}/scratch
         run: |
-          # Strip Git's bin + usr/bin out of PATH so MSVC's link.exe
-          # isn't shadowed by Git's coreutils link.exe inside sh.exe.
+          # PATH-strip alone is NOT enough: when ffmpeg's configure
+          # spawns sh.exe (Git Bash), MSYS re-prepends its own
+          # /usr/bin (= C:\Program Files\Git\usr\bin) inside the
+          # subshell — undoing anything we did to the parent PATH.
+          # Inside that subshell, the GNU coreutils `link.exe`
+          # shadows MSVC's `link.exe`, so cl.exe's compile-test
+          # fails with "cl.exe is unable to create an executable
+          # file" and ffmpeg's configure aborts.
+          #
+          # Belt-and-braces fix:
+          #   1. Strip Git's dirs from the parent PATH (kept from
+          #      before — doesn't hurt, may help with other tools).
+          #   2. RENAME C:\Program Files\Git\usr\bin\link.exe out of
+          #      the way for the duration of the build. Even if MSYS
+          #      re-adds /usr/bin to the sh.exe PATH, there's no
+          #      link.exe there to find, so the lookup falls through
+          #      to MSVC's link.exe. Restored in `finally` so the
+          #      runner image isn't left modified.
           $clean = ($env:PATH -split ';') | Where-Object {
             $_ -notmatch '\\Git\\(usr\\)?bin\b' -and $_ -ne ''
           }
           $env:PATH = ($clean -join ';')
-          # ffmpeg's configure still needs sh.exe. Git's sh.exe lives
-          # at C:\Program Files\Git\bin\sh.exe even after we stripped
-          # the bin dir; we add it back surgically (only sh.exe's dir,
-          # not coreutils).
           $env:PATH = "C:\Program Files\Git\bin;$env:PATH"
-          cargo build --release
+
+          $gitLink = "C:\Program Files\Git\usr\bin\link.exe"
+          $gitLinkBak = "$gitLink.disabled-by-acrux-build"
+          if (Test-Path $gitLink) {
+            Write-Host "Renaming $gitLink → $gitLinkBak to keep MSVC link.exe winning the lookup"
+            Move-Item -Force $gitLink $gitLinkBak
+          }
+          try {
+            cargo build --release
+          } finally {
+            if (Test-Path $gitLinkBak) {
+              Move-Item -Force $gitLinkBak $gitLink
+            }
+          }
 
       - name: Build ffmpeg (Mac / Linux)
         if: runner.os != 'Windows'
