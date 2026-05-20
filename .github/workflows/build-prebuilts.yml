@@ -1,12 +1,13 @@
 # Build + publish ffmpeg static-lib tarballs for Acrux.
 #
 # Triggered manually via `gh workflow run build-prebuilts.yml` (or
-# the "Run workflow" button in the GitHub UI). All three platforms
-# run in parallel, each producing one tarball uploaded as a release
-# asset under the `ffmpeg-prebuilt-vX.Y.Z` tag (see the `version`
-# input below).
+# the "Run workflow" button in the GitHub UI). Mac/Linux jobs build
+# ffmpeg from source; Windows downloads a prebuilt from BtbN and
+# repackages it (see comment above the Windows step for why).
+# All four tarballs end up as release assets under the
+# `ffmpeg-prebuilt-vX.Y.Z` tag (see the `version` input below).
 #
-# What each job does:
+# Mac/Linux flow:
 #   1. Compile ffmpeg-sys-next's `build` feature in a scratch crate
 #      — that does the heavy lifting of cloning ffmpeg source and
 #      ./configure + make with the right flags (LGPLv3, OpenSSL for
@@ -14,15 +15,14 @@
 #   2. Pluck the resulting libavformat/libavcodec/libavutil out of
 #      the build output.
 #   3. Strip debug symbols.
-#   4. Tar + upload as `ffmpeg-prebuilt-{os}-{arch}.tar.gz` to the
-#      release.
+#   4. Tar + upload as `ffmpeg-prebuilt-{os}-{arch}.tar.gz`.
 #
-# Windows-specific footgun: ffmpeg's configure script needs a POSIX
-# shell, but Git Bash's sh.exe pulls in Git's `usr/bin` directory
-# which contains a GNU coreutils `link.exe` that shadows MSVC's
-# link.exe inside the sh.exe child process. We work around this by
-# carving Git out of PATH right before the cargo build kicks off —
-# leaving just the MSVC toolchain + the bare sh.exe path we need.
+# Windows flow (different — see big comment above its step):
+#   1. Download BtbN's prebuilt LGPL shared zip pinned to ffmpeg
+#      n8.1.
+#   2. Repackage include/ + lib/{avformat,avcodec,avutil}.lib +
+#      bin/*.dll into our tarball layout.
+#   3. Tar + upload.
 
 name: Build ffmpeg prebuilts
 
@@ -52,33 +52,27 @@ jobs:
           - runner: macos-14
             tarball: ffmpeg-prebuilt-darwin-arm64
             strip: strip -S
-            lib_ext: .a
-            lib_prefix: lib
           - runner: macos-13
             tarball: ffmpeg-prebuilt-darwin-x86_64
             strip: strip -S
-            lib_ext: .a
-            lib_prefix: lib
           - runner: ubuntu-22.04
             tarball: ffmpeg-prebuilt-linux-x86_64
             strip: strip -g
-            lib_ext: .a
-            lib_prefix: lib
           - runner: windows-2022
             tarball: ffmpeg-prebuilt-windows-x86_64
-            strip: ''  # MSVC archives stripped by linker on consume side
-            lib_ext: .a  # ffmpeg-sys-next produces .a even on Windows because it builds via mingw-make + gcc when using the build feature
-            lib_prefix: lib
+            # Windows is a repackage job — BtbN's .libs are tiny
+            # import libraries and DLLs come pre-stripped.
+            strip: ''
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust
+      # ===== Mac / Linux: build ffmpeg from source =====
+
+      - name: Install Rust (Unix)
+        if: runner.os != 'Windows'
         uses: dtolnay/rust-toolchain@stable
 
-      # Mac / Linux build-time deps. Mac already has clang + git via
-      # Xcode CLT pre-installed on GHA runners; Linux needs nasm +
-      # build-essential.
       - name: Install Linux deps
         if: runner.os == 'Linux'
         run: |
@@ -90,31 +84,11 @@ jobs:
         run: |
           brew install nasm yasm pkg-config openssl@3
 
-      # Windows: install nasm + yasm via choco. choco doesn't refresh
-      # the current shell's PATH after install — Get-Command nasm
-      # would fail because nasm was just installed but PATH is the
-      # one cached at shell start. We hardcode chocolatey's standard
-      # install locations into GITHUB_PATH instead (which propagates
-      # to subsequent steps cleanly). Choco installs both tools under
-      # C:\Program Files\NASM and C:\ProgramData\chocolatey\bin.
-      - name: Install Windows deps
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          choco install -y nasm yasm
-          "C:\Program Files\NASM" | Out-File -FilePath $env:GITHUB_PATH -Append
-          "C:\ProgramData\chocolatey\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
-
       # Build ffmpeg via ffmpeg-sys-next's `build` feature in a
       # throwaway crate. Same code path Acrux's `build.rs` used to
       # invoke, just isolated here so the artifact is reproducible.
-      #
-      # On Windows: `${{ runner.temp }}` expands to `D:\a\_temp` —
-      # the backslashes get eaten by bash escape processing (the
-      # `\a` is treated as escape and silently dropped). So we use
-      # the `$RUNNER_TEMP` env var inside the bash script with
-      # quotes — value's resolved at run time, no escape pass.
-      - name: Create scratch crate
+      - name: Create scratch crate (Unix)
+        if: runner.os != 'Windows'
         shell: bash
         run: |
           set -euo pipefail
@@ -133,71 +107,14 @@ jobs:
           echo "fn main() {}" > "$RUNNER_TEMP/scratch/src/main.rs"
           ls -la "$RUNNER_TEMP/scratch"
 
-      # The actual compile. On Windows we run this from a developer
-      # PowerShell with vcvars64 applied via ilammy/msvc-dev-cmd, and
-      # we manually scrub Git from PATH before launching cargo so
-      # ffmpeg's configure can't pick up the wrong link.exe.
-      - name: Set up MSVC (Windows only)
-        if: runner.os == 'Windows'
-        uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: x64
-
-      - name: Build ffmpeg (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        working-directory: ${{ runner.temp }}/scratch
-        run: |
-          # PATH-strip alone is NOT enough: when ffmpeg's configure
-          # spawns sh.exe (Git Bash), MSYS re-prepends its own
-          # /usr/bin (= C:\Program Files\Git\usr\bin) inside the
-          # subshell — undoing anything we did to the parent PATH.
-          # Inside that subshell, the GNU coreutils `link.exe`
-          # shadows MSVC's `link.exe`, so cl.exe's compile-test
-          # fails with "cl.exe is unable to create an executable
-          # file" and ffmpeg's configure aborts.
-          #
-          # Belt-and-braces fix:
-          #   1. Strip Git's dirs from the parent PATH (kept from
-          #      before — doesn't hurt, may help with other tools).
-          #   2. RENAME C:\Program Files\Git\usr\bin\link.exe out of
-          #      the way for the duration of the build. Even if MSYS
-          #      re-adds /usr/bin to the sh.exe PATH, there's no
-          #      link.exe there to find, so the lookup falls through
-          #      to MSVC's link.exe. Restored in `finally` so the
-          #      runner image isn't left modified.
-          $clean = ($env:PATH -split ';') | Where-Object {
-            $_ -notmatch '\\Git\\(usr\\)?bin\b' -and $_ -ne ''
-          }
-          $env:PATH = ($clean -join ';')
-          $env:PATH = "C:\Program Files\Git\bin;$env:PATH"
-
-          $gitLink = "C:\Program Files\Git\usr\bin\link.exe"
-          $gitLinkBak = "$gitLink.disabled-by-acrux-build"
-          if (Test-Path $gitLink) {
-            Write-Host "Renaming $gitLink → $gitLinkBak to keep MSVC link.exe winning the lookup"
-            Move-Item -Force $gitLink $gitLinkBak
-          }
-          try {
-            cargo build --release
-          } finally {
-            if (Test-Path $gitLinkBak) {
-              Move-Item -Force $gitLinkBak $gitLink
-            }
-          }
-
-      - name: Build ffmpeg (Mac / Linux)
+      - name: Build ffmpeg (Unix)
         if: runner.os != 'Windows'
         shell: bash
         working-directory: ${{ runner.temp }}/scratch
         run: cargo build --release
 
-      # Find and stage the libs. ffmpeg-sys-next dumps headers + libs
-      # at `target/release/build/ffmpeg-sys-next-*/out/dist/`. We use
-      # bash everywhere (Windows runners have Git Bash) so path
-      # handling is uniform — `runner.temp` expands to a path that
-      # bash understands on every OS.
-      - name: Stage libs
+      - name: Stage libs (Unix)
+        if: runner.os != 'Windows'
         shell: bash
         run: |
           set -euo pipefail
@@ -207,14 +124,98 @@ jobs:
           mkdir -p "$STAGE/include" "$STAGE/lib"
           cp -R "$DIST/include/"* "$STAGE/include/"
           cp "$DIST/lib/"*.a "$STAGE/lib/"
-          # Strip debug symbols — cuts the tarball ~10x. Windows
-          # static libs come out of ffmpeg-sys-next's MinGW-shim
-          # toolchain as ELF/COFF .a archives, which `strip -S`
-          # doesn't always recognise; tolerate failure there.
+          # Strip debug symbols — cuts the tarball ~10x.
           if [ -n "${{ matrix.strip }}" ]; then
             ${{ matrix.strip }} "$STAGE/lib/"*.a 2>/dev/null || true
           fi
           ls -lh "$STAGE/lib/"
+
+      # ===== Windows: download BtbN prebuilt + repackage =====
+      #
+      # We do NOT build ffmpeg from source on Windows. Multiple
+      # rounds proved it's a doomed approach in CI:
+      #
+      #   ffmpeg's ./configure is a POSIX shell script. On Windows
+      #   it runs inside Git Bash's sh.exe. MSYS in sh.exe re-adds
+      #   /usr/bin (= C:\Program Files\Git\usr\bin) to PATH inside
+      #   the subshell, no matter what we do to the parent shell's
+      #   PATH. /usr/bin contains GNU coreutils' `link.exe` (an
+      #   ln-like tool) which then shadows MSVC's `link.exe`, so
+      #   cl.exe's compile-test inside configure fails with
+      #   "cl.exe is unable to create an executable file" and
+      #   the whole build aborts. Renaming link.exe wasn't enough;
+      #   the failure mode keeps moving forward.
+      #
+      # Pivot: BtbN (github.com/BtbN/FFmpeg-Builds) cross-compiles
+      # ffmpeg from Linux with mingw-w64 and publishes LGPL builds
+      # with MSVC-compatible import .lib files plus matching .dll
+      # runtime files. We download their `n8.1-latest` LGPL shared
+      # build (frozen to ffmpeg n8.1, matches our pinned version)
+      # and repackage into our tarball layout.
+      #
+      # Tradeoff: shared libs mean Acrux ships 3 .dlls (~25MB) next
+      # to Acrux.exe instead of statically linking. Same net footprint
+      # as Mac/Linux static builds. Tauri's bundler picks them up
+      # via FFMPEG_DIR/bin (see Acrux's build.rs + tauri.conf.json).
+      - name: Download + stage BtbN prebuilt (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # `n8.1-latest` is BtbN's rolling-tag for the n8.1 ffmpeg
+          # release line. If they ever stop publishing it, switch to
+          # `latest` (master rolling) or pin to a specific autobuild
+          # tag for full reproducibility.
+          URL="https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-win64-lgpl-shared-8.1.zip"
+          ZIP="$RUNNER_TEMP/btbn.zip"
+          echo "Downloading $URL"
+          curl -fsSL --retry 3 -o "$ZIP" "$URL"
+          ls -lh "$ZIP"
+
+          EXTRACT="$RUNNER_TEMP/btbn-extract"
+          rm -rf "$EXTRACT"
+          mkdir -p "$EXTRACT"
+          unzip -q "$ZIP" -d "$EXTRACT"
+
+          # BtbN's zip extracts to one top-level dir like
+          # `ffmpeg-n8.1-latest-win64-lgpl-shared-8.1/`. Find it.
+          BTBN_ROOT=$(ls -d "$EXTRACT"/ffmpeg-*-win64-lgpl-shared* | head -1)
+          echo "BtbN root: $BTBN_ROOT"
+          ls "$BTBN_ROOT"
+
+          STAGE="$RUNNER_TEMP/stage"
+          rm -rf "$STAGE"
+          mkdir -p "$STAGE/include" "$STAGE/lib" "$STAGE/bin"
+
+          # Headers: all of them. ffmpeg-sys-next bindgen reads
+          # whatever is in FFMPEG_DIR/include.
+          cp -R "$BTBN_ROOT/include/"* "$STAGE/include/"
+
+          # Import libs: only the three Acrux actually links.
+          cp "$BTBN_ROOT/lib/avformat.lib" "$STAGE/lib/"
+          cp "$BTBN_ROOT/lib/avcodec.lib" "$STAGE/lib/"
+          cp "$BTBN_ROOT/lib/avutil.lib" "$STAGE/lib/"
+
+          # Runtime DLLs: avformat / avcodec / avutil and the
+          # transitive deps avcodec links internally (swresample,
+          # swscale). Names look like `avformat-61.dll` where 61 is
+          # the major SOVER.
+          cp "$BTBN_ROOT/bin/"avformat-*.dll "$STAGE/bin/"
+          cp "$BTBN_ROOT/bin/"avcodec-*.dll "$STAGE/bin/"
+          cp "$BTBN_ROOT/bin/"avutil-*.dll "$STAGE/bin/"
+          cp "$BTBN_ROOT/bin/"swresample-*.dll "$STAGE/bin/" 2>/dev/null || true
+          cp "$BTBN_ROOT/bin/"swscale-*.dll "$STAGE/bin/" 2>/dev/null || true
+
+          # Sanity prints so the workflow log makes the staged
+          # contents obvious.
+          echo "=== lib/ ==="
+          ls -lh "$STAGE/lib/"
+          echo "=== bin/ ==="
+          ls -lh "$STAGE/bin/"
+          echo "Header count: $(find "$STAGE/include" -name '*.h' | wc -l)"
+          echo "Bin total:    $(du -sh "$STAGE/bin" | cut -f1)"
+
+      # ===== Package + upload (all OSes) =====
 
       - name: Package tarball
         shell: bash
@@ -222,7 +223,14 @@ jobs:
           set -euo pipefail
           cd "$RUNNER_TEMP/stage"
           TARBALL="$RUNNER_TEMP/${{ matrix.tarball }}.tar.gz"
-          tar -czf "$TARBALL" include lib
+          # Windows tarball includes a bin/ dir for the .dlls; Unix
+          # tarballs only have include/ + lib/. Tar both if bin/
+          # exists, otherwise just the two.
+          if [ -d bin ]; then
+            tar -czf "$TARBALL" include lib bin
+          else
+            tar -czf "$TARBALL" include lib
+          fi
           ls -lh "$TARBALL"
           # Print SHA256 to the workflow log so we can copy it into
           # Acrux's build.rs constants.
@@ -238,9 +246,12 @@ jobs:
           tag_name: ffmpeg-prebuilt-${{ inputs.version }}
           name: ffmpeg prebuilt ${{ inputs.version }}
           body: |
-            Static ffmpeg libs (LGPLv3, mux + RTMP + OpenSSL, no
-            encoders) consumed by Acrux's `build.rs`. Built
-            reproducibly from this workflow — see workflow log for
-            SHA256s to paste into Acrux's `build.rs`.
+            ffmpeg libs (LGPLv3, mux + RTMP + TLS, no encoders)
+            consumed by Acrux's `build.rs`. Mac/Linux statically
+            built from source via ffmpeg-sys-next; Windows
+            repackaged from BtbN's prebuilt LGPL shared libs (DLLs
+            shipped alongside Acrux.exe via Tauri's bundler).
+            See SHA256s in the workflow log to paste into Acrux's
+            `build.rs`.
           files: ${{ runner.temp }}/${{ matrix.tarball }}.tar.gz
           fail_on_unmatched_files: true
